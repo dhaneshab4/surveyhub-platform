@@ -1,0 +1,126 @@
+name: CD
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        required: true
+        default: staging
+        type: choice
+        options: [staging, production]
+
+# Never let two deploys race for the same environment.
+concurrency:
+  group: cd-${{ github.event.inputs.environment || 'staging' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: Gate on CI
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    steps:
+      - run: echo "CI green — proceeding"
+
+  # ------------------------------------------------------------------- staging
+  staging:
+    name: Deploy staging
+    needs: gate
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://surveyhub-api-staging.fly.dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Deploy backend
+        working-directory: surveyhubbackend
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          flyctl deploy --remote-only \
+            --app surveyhub-api-staging \
+            --config fly.staging.toml \
+            --build-arg APP_VERSION=${{ github.sha }} \
+            --wait-timeout 300
+
+      - name: Smoke test
+        run: bash .github/scripts/smoke.sh https://surveyhub-api-staging.fly.dev
+
+  # ---------------------------------------------------------------- production
+  production:
+    name: Deploy production
+    needs: staging
+    runs-on: ubuntu-latest
+    # Requires a reviewer on the `production` environment in repo settings; that is the
+    # approval gate, and it is enforced by GitHub rather than by convention.
+    environment:
+      name: production
+      url: https://surveyhub-api.fly.dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Record the currently deployed release
+        id: current
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          PREV=$(flyctl releases --app surveyhub-api --json 2>/dev/null \
+                 | python3 -c 'import sys,json; print(json.load(sys.stdin)[0]["Version"])' \
+                 2>/dev/null || echo "")
+          echo "previous=$PREV" >> "$GITHUB_OUTPUT"
+          echo "rollback target: v$PREV"
+
+      - name: Deploy backend
+        working-directory: surveyhubbackend
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          flyctl deploy --remote-only \
+            --app surveyhub-api \
+            --build-arg APP_VERSION=${{ github.sha }} \
+            --strategy rolling \
+            --wait-timeout 300
+
+      - name: Smoke test
+        id: smoke
+        run: bash .github/scripts/smoke.sh https://surveyhub-api.fly.dev
+
+      - name: Roll back on failed smoke test
+        if: failure() && steps.smoke.outcome == 'failure' && steps.current.outputs.previous != ''
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          echo "::error::Smoke test failed — rolling back to v${{ steps.current.outputs.previous }}"
+          flyctl releases rollback ${{ steps.current.outputs.previous }} --app surveyhub-api --yes
+
+      - name: Deploy frontend
+        working-directory: surveyhub-frontend
+        env:
+          NEXT_PUBLIC_API_URL: https://surveyhub-api.fly.dev
+          NEXT_TELEMETRY_DISABLED: "1"
+        run: |
+          npm ci
+          npm run build
+
+      - name: Publish to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: surveyhub-frontend
+          command: pages deploy out --project-name surveyhub --branch main

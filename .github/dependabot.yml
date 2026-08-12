@@ -1,0 +1,44 @@
+version: 2
+
+updates:
+  - package-ecosystem: pip
+    directory: /surveyhubbackend
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      # One PR for the routine patch churn, individual PRs for anything that could
+      # plausibly break. Fifteen separate PRs a week just get ignored.
+      patch-updates:
+        update-types: [patch]
+      django:
+        patterns: ["Django", "djangorestframework*", "django-*"]
+    labels: [dependencies, backend]
+
+  - package-ecosystem: npm
+    directory: /surveyhub-frontend
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      patch-updates:
+        update-types: [patch, minor]
+      react:
+        patterns: ["react", "react-dom", "next", "@types/react*"]
+    labels: [dependencies, frontend]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    labels: [dependencies, ci]
+
+  - package-ecosystem: docker
+    directories:
+      - /surveyhubbackend
+      - /surveyhub-frontend
+    schedule:
+      interval: monthly
+    labels: [dependencies, docker]

@@ -1,0 +1,285 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to a PR makes the in-flight run pointless; cancel it rather than pay for it.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "20"
+  REGISTRY: ghcr.io
+
+jobs:
+  # ---------------------------------------------------------------- backend tests
+  backend:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: surveyhub_test
+          POSTGRES_USER: surveyhub
+          POSTGRES_PASSWORD: surveyhub
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U surveyhub"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      SECRET_KEY: ci-secret-not-used-anywhere-real
+      DEBUG: "False"
+      ALLOWED_HOSTS: localhost,127.0.0.1,testserver
+      DATABASE_URL: postgres://surveyhub:surveyhub@localhost:5432/surveyhub_test
+      GEMINI_API_KEY: ""
+    defaults:
+      run:
+        working-directory: surveyhubbackend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: surveyhubbackend/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff coverage
+
+      - name: Lint
+        run: ruff check . --output-format=github
+
+      - name: Check for missing migrations
+        # Catches the classic "model changed, migration forgotten" break, which only
+        # shows up at deploy time otherwise.
+        run: python manage.py makemigrations --check --dry-run
+
+      - name: Django system checks (production profile)
+        run: python manage.py check --deploy --fail-level WARNING
+        continue-on-error: true
+
+      - name: Test with coverage
+        run: |
+          coverage run --source='.' manage.py test surveys -v 2
+          coverage report --skip-covered
+          coverage xml
+
+      - name: Verify operational endpoints respond
+        run: |
+          python manage.py migrate --noinput
+          gunicorn surveyhubbackend.wsgi:application --bind 127.0.0.1:8000 --workers 1 &
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8000/healthz && break || sleep 1
+          done
+          curl -fsS http://127.0.0.1:8000/healthz | tee /dev/stderr | grep -q '"status": "ok"'
+          curl -fsS http://127.0.0.1:8000/readyz  | tee /dev/stderr | grep -q '"status": "ready"'
+          curl -fsS http://127.0.0.1:8000/metrics | grep -q 'surveyhub_http_requests_total'
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backend-coverage
+          path: surveyhubbackend/coverage.xml
+          retention-days: 7
+
+  # --------------------------------------------------------------- frontend build
+  frontend:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: surveyhub-frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: surveyhub-frontend/package-lock.json
+
+      - run: npm ci
+
+      - name: Lint
+        run: npm run lint
+        continue-on-error: true
+
+      - name: Build static export
+        env:
+          NEXT_PUBLIC_API_URL: https://surveyhub-api.fly.dev
+          NEXT_TELEMETRY_DISABLED: "1"
+        run: npm run build
+
+      - name: Assert the export actually produced files
+        # `output: "export"` silently produces nothing if a page opts into SSR, and the
+        # deploy would then publish an empty site.
+        run: |
+          test -f out/index.html || { echo "::error::out/index.html missing"; exit 1; }
+          echo "exported $(find out -type f | wc -l) files"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: surveyhub-frontend/out
+          retention-days: 7
+
+  # -------------------------------------------------------------------- security
+  security:
+    name: Security scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Dependency and config scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scanners: vuln,secret,misconfig
+          severity: CRITICAL,HIGH
+          format: sarif
+          output: trivy-fs.sarif
+          exit-code: "0"
+
+      - name: Upload to code scanning
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+      - name: Fail on CRITICAL vulnerabilities
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scanners: vuln
+          severity: CRITICAL
+          ignore-unfixed: true
+          format: table
+          exit-code: "1"
+
+      - name: Secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------------- policy
+  policy:
+    name: Policy as code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint Dockerfiles
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: surveyhubbackend/Dockerfile
+          failure-threshold: warning
+
+      - name: Lint frontend Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: surveyhub-frontend/Dockerfile
+          failure-threshold: warning
+
+      - name: Install conftest
+        run: |
+          curl -sSL https://github.com/open-policy-agent/conftest/releases/download/v0.56.0/conftest_0.56.0_Linux_x86_64.tar.gz \
+            | sudo tar xz -C /usr/local/bin conftest
+
+      - name: Enforce container policy
+        run: |
+          conftest test --policy policy/ --parser dockerfile \
+            surveyhubbackend/Dockerfile surveyhub-frontend/Dockerfile
+          conftest test --policy policy/ docker-compose.yml
+
+  # ------------------------------------------------------------ build and publish
+  images:
+    name: Build images
+    runs-on: ubuntu-latest
+    needs: [backend, frontend, policy]
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: backend
+            context: surveyhubbackend
+          - name: frontend
+            context: surveyhub-frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.name }}
+          tags: |
+            type=sha,format=long
+            type=ref,event=branch
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          push: ${{ github.event_name == 'push' }}
+          load: ${{ github.event_name != 'push' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            NEXT_PUBLIC_API_URL=https://surveyhub-api.fly.dev
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,scope=${{ matrix.name }},mode=max
+          provenance: true
+          sbom: true
+
+      - name: Scan the built image
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.name }}:sha-${{ github.sha }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          format: table
+          exit-code: "0"
+
+      - name: Confirm the image does not run as root
+        # A container running as root passes every functional test and fails every
+        # security review, so it is asserted here rather than discovered later.
+        run: |
+          IMAGE=${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.name }}:sha-${{ github.sha }}
+          docker pull -q "$IMAGE" 2>/dev/null || true
+          USERSPEC=$(docker image inspect "$IMAGE" --format '{{.Config.User}}' 2>/dev/null || echo "")
+          echo "image user: '${USERSPEC:-<root>}'"
+          if [ -z "$USERSPEC" ] || [ "$USERSPEC" = "root" ] || [ "$USERSPEC" = "0" ]; then
+            echo "::error::${{ matrix.name }} image runs as root"; exit 1
+          fi
