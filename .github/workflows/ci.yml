@@ -93,7 +93,7 @@ jobs:
           curl -fsS http://127.0.0.1:8000/readyz  | tee /dev/stderr | grep -q '"status": "ready"'
           curl -fsS http://127.0.0.1:8000/metrics | grep -q 'surveyhub_http_requests_total'
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: backend-coverage
@@ -135,7 +135,7 @@ jobs:
           test -f out/index.html || { echo "::error::out/index.html missing"; exit 1; }
           echo "exported $(find out -type f | wc -l) files"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: frontend-dist
           path: surveyhub-frontend/out
