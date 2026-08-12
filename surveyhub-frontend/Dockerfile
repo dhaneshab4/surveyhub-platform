@@ -25,7 +25,7 @@ ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL} \
 RUN npm run build
 
 # ---------------------------------------------------------------------------- runtime
-FROM nginx:1.27-alpine AS runtime
+FROM nginx:1.31-alpine AS runtime
 
 RUN rm -rf /usr/share/nginx/html/* /etc/nginx/conf.d/default.conf
 
