@@ -1,19 +1,31 @@
-# fly.toml app configuration file generated for surveyhub-api on 2026-04-30T20:01:11+05:30
+# Production configuration for surveyhub-api.
 #
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
-#
+# Deployed by .github/workflows/cd.yml, never by hand — a manual `fly deploy` skips the
+# smoke test and the automatic rollback.
 
 app = 'surveyhub-api'
-primary_region = 'sin'
+primary_region = 'lhr'
 console_command = '/code/manage.py shell'
 
 [build]
 
 [deploy]
   release_command = 'python manage.py migrate --noinput'
+  # Rolling needs at least two machines to be genuinely zero-downtime; with one it
+  # still drains connections before replacing, which is better than immediate.
+  strategy = 'rolling'
 
 [env]
   PORT = '8000'
+  ENVIRONMENT = 'production'
+  DEBUG = 'False'
+  LOG_LEVEL = 'INFO'
+  GUNICORN_WORKERS = '3'
+  GUNICORN_THREADS = '4'
+  GUNICORN_TIMEOUT = '90'
+  ALLOWED_HOSTS = 'surveyhub-api.fly.dev'
+  # Counters are per-worker; without a shared dir /metrics reports one worker's view.
+  PROMETHEUS_MULTIPROC_DIR = '/tmp/prometheus'
 
 [http_service]
   internal_port = 8000
@@ -23,11 +35,31 @@ console_command = '/code/manage.py shell'
   min_machines_running = 0
   processes = ['app']
 
+  [http_service.concurrency]
+    type = 'requests'
+    # Gunicorn serves workers x threads = 12 concurrently. Queueing far beyond that
+    # just converts a capacity problem into a latency problem.
+    soft_limit = 40
+    hard_limit = 60
+
+# Readiness, not liveness: a database blip should take the machine out of rotation
+# without triggering a restart loop that makes the outage worse.
+[[http_service.checks]]
+  interval = '15s'
+  timeout = '10s'
+  grace_period = '30s'
+  method = 'GET'
+  path = '/readyz'
+
 [[vm]]
-  memory = '256mb'
+  # 256mb could not hold 3 gunicorn workers; the OOM killer would reap them under load.
+  memory = '512mb'
   cpu_kind = 'shared'
   cpus = 1
 
+# settings.py sets STATIC_ROOT = BASE_DIR/'staticfiles'. This previously pointed at
+# /code/static, which collectstatic never creates, so the mount was inert and every
+# static request fell through to WhiteNoise inside the Python process.
 [[statics]]
-  guest_path = '/code/static'
+  guest_path = '/code/staticfiles'
   url_prefix = '/static/'

@@ -1,0 +1,57 @@
+# Staging. Identical topology to production so a deploy that works here works there;
+# the only differences are scale and log verbosity.
+
+app = 'surveyhub-api-staging'
+primary_region = 'lhr'
+console_command = '/code/manage.py shell'
+
+[build]
+
+[deploy]
+  release_command = 'python manage.py migrate --noinput'
+  # Staging runs a single machine, so rolling has nothing to roll against; immediate
+  # is faster and the brief gap does not matter here.
+  strategy = 'immediate'
+
+[env]
+  PORT = '8000'
+  ENVIRONMENT = 'staging'
+  DEBUG = 'False'
+  LOG_LEVEL = 'DEBUG'
+  GUNICORN_WORKERS = '2'
+  ALLOWED_HOSTS = 'surveyhub-api-staging.fly.dev'
+  PROMETHEUS_MULTIPROC_DIR = '/tmp/prometheus'
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
+
+  [http_service.concurrency]
+    type = 'requests'
+    soft_limit = 40
+    hard_limit = 60
+
+# Fly stops routing to a machine that fails this, which is the whole point of having
+# /readyz separate from /healthz — a database blip sheds traffic without a restart loop.
+[[http_service.checks]]
+  interval = '15s'
+  timeout = '10s'
+  grace_period = '30s'
+  method = 'GET'
+  path = '/readyz'
+
+[[vm]]
+  memory = '512mb'
+  cpu_kind = 'shared'
+  cpus = 1
+
+# settings.py sets STATIC_ROOT = BASE_DIR/'staticfiles'. The original fly.toml pointed
+# this at /code/static, which collectstatic never creates, so the mount was inert and
+# every static request fell through to WhiteNoise in the Python process.
+[[statics]]
+  guest_path = '/code/staticfiles'
+  url_prefix = '/static/'
