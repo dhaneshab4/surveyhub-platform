@@ -37,6 +37,9 @@ CORS_ALLOWED_ORIGINS = [
 CORS_ALLOW_CREDENTIALS = True
 
 MIDDLEWARE = [
+    # Outermost so the histogram captures time spent in every layer below it,
+    # including SecurityMiddleware redirects and CORS preflights.
+    'surveys.observability.PrometheusMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
@@ -106,6 +109,12 @@ if not DEBUG:
     # Fly.io terminates TLS at the proxy and forwards X-Forwarded-Proto
     SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
     SECURE_SSL_REDIRECT = True
+
+    # Probes reach these over plain HTTP on the loopback or the internal network, where
+    # there is no X-Forwarded-Proto to satisfy the redirect. Without an exemption they
+    # get a 301 with an empty body: the Docker HEALTHCHECK then "succeeds" on a redirect
+    # while telling you nothing, and Fly's /readyz check never sees a status.
+    SECURE_REDIRECT_EXEMPT = [r'^healthz$', r'^readyz$', r'^metrics$']
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
     SECURE_HSTS_SECONDS = 31536000
@@ -150,3 +159,36 @@ DEFAULT_FROM_EMAIL = EMAIL_HOST_USER
 
 GEMINI_API_KEY = config('GEMINI_API_KEY', default='')
 GEMINI_MODEL = config('GEMINI_MODEL', default='gemini-2.5-flash-lite')
+
+# ── Observability ──────────────────────────────────────────────────────────────
+APP_VERSION = config('APP_VERSION', default='dev')
+ENVIRONMENT = config('ENVIRONMENT', default='local')
+
+# JSON to stdout. Anything else forces the log pipeline to parse free text, and the
+# request id that ties a user report to a trace gets lost on the way.
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'json': {
+            '()': 'logging.Formatter',
+            'format': '{"ts":"%(asctime)s","level":"%(levelname)s",'
+                      '"logger":"%(name)s","msg":"%(message)s",'
+                      f'"version":"{APP_VERSION}","env":"{ENVIRONMENT}"}}',
+        },
+        'plain': {'format': '%(asctime)s %(levelname)-7s %(name)s %(message)s'},
+    },
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'plain' if DEBUG else 'json',
+        },
+    },
+    'root': {'handlers': ['console'], 'level': config('LOG_LEVEL', default='INFO')},
+    'loggers': {
+        'django.request': {'handlers': ['console'], 'level': 'WARNING',
+                           'propagate': False},
+        # Query logs at DEBUG are enormous; opt in explicitly when hunting N+1s.
+        'django.db.backends': {'level': config('SQL_LOG_LEVEL', default='WARNING')},
+    },
+}

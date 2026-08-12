@@ -1,0 +1,167 @@
+# Service level objectives and multi-window multi-burn-rate alerting.
+#
+# Two SLOs, both measured over a rolling 30 days:
+#
+#   Availability   99.5%  of requests are not 5xx      -> error budget 0.5% ≈ 3h 39m/month
+#   Latency        99.0%  of requests complete < 1s
+#
+# Alerting follows the Google SRE workbook: page only when the error budget is burning
+# fast enough to matter, and require a short window to agree with a long one so a
+# thirty-second blip does not wake anyone up.
+#
+#   14.4x burn over 1h  -> 2% of budget spent  -> page   (budget gone in ~2 days)
+#    6x   burn over 6h  -> 5% of budget spent  -> page   (budget gone in ~5 days)
+#    1x   burn over 3d  -> ticket, not a page
+
+groups:
+  # ------------------------------------------------------------------ recording
+  - name: surveyhub_slo_recording
+    interval: 30s
+    rules:
+      - record: job:http_requests:rate5m
+        expr: sum(rate(surveyhub_http_requests_total[5m]))
+
+      - record: job:http_errors:ratio_rate5m
+        expr: |
+          (sum(rate(surveyhub_http_requests_total{status=~"5.."}[5m])) or vector(0))
+            /
+          clamp_min(sum(rate(surveyhub_http_requests_total[5m])), 1e-9)
+
+      - record: job:http_errors:ratio_rate30m
+        expr: |
+          (sum(rate(surveyhub_http_requests_total{status=~"5.."}[30m])) or vector(0))
+            /
+          clamp_min(sum(rate(surveyhub_http_requests_total[30m])), 1e-9)
+
+      - record: job:http_errors:ratio_rate1h
+        expr: |
+          (sum(rate(surveyhub_http_requests_total{status=~"5.."}[1h])) or vector(0))
+            /
+          clamp_min(sum(rate(surveyhub_http_requests_total[1h])), 1e-9)
+
+      - record: job:http_errors:ratio_rate6h
+        expr: |
+          (sum(rate(surveyhub_http_requests_total{status=~"5.."}[6h])) or vector(0))
+            /
+          clamp_min(sum(rate(surveyhub_http_requests_total[6h])), 1e-9)
+
+      # Latency SLI: the share of requests served inside the 1s objective, read straight
+      # off the histogram bucket rather than from a quantile estimate.
+      #
+      # The `le` matcher is a regex on purpose. Prometheus does not normalise the label
+      # when matching, and the Python client serialises the bucket boundary as "1.0" —
+      # so `le="1"` silently matches nothing and the SLI reads as no-data forever. A
+      # latency objective that quietly evaluates to nothing is worse than not having one.
+      - record: job:http_latency:good_ratio_rate1h
+        expr: |
+          (sum(rate(surveyhub_http_request_duration_seconds_bucket{le=~"1(\\.0+)?"}[1h])) or vector(0))
+            /
+          clamp_min(sum(rate(surveyhub_http_request_duration_seconds_count[1h])), 1e-9)
+
+      - record: job:http_latency:p95_5m
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(surveyhub_http_request_duration_seconds_bucket[5m]))
+          )
+
+      # `or vector(0)` so the cost panel reads $0.00 before the first Gemini call rather
+      # than rendering blank, which is indistinguishable from a broken dashboard.
+      - record: job:gemini_cost:rate1h_usd
+        expr: (sum(rate(surveyhub_gemini_cost_usd_total[1h])) or vector(0)) * 3600
+
+  # --------------------------------------------------------------------- alerts
+  - name: surveyhub_slo_alerts
+    rules:
+      - alert: ErrorBudgetBurningFast
+        expr: |
+          job:http_errors:ratio_rate1h  > (14.4 * 0.005)
+            and
+          job:http_errors:ratio_rate5m  > (14.4 * 0.005)
+        for: 2m
+        labels:
+          severity: page
+          slo: availability
+        annotations:
+          summary: Availability error budget burning at 14.4x
+          description: >-
+            {{ $value | humanizePercentage }} of requests are failing. At this rate the
+            30-day error budget is exhausted in about two days.
+          runbook: PLATFORM.md#error-budget-burn
+
+      - alert: ErrorBudgetBurningSlow
+        expr: |
+          job:http_errors:ratio_rate6h  > (6 * 0.005)
+            and
+          job:http_errors:ratio_rate30m > (6 * 0.005)
+        for: 15m
+        labels:
+          severity: page
+          slo: availability
+        annotations:
+          summary: Availability error budget burning at 6x
+          runbook: PLATFORM.md#error-budget-burn
+
+      - alert: LatencyObjectiveAtRisk
+        expr: job:http_latency:good_ratio_rate1h < 0.99
+        for: 10m
+        labels:
+          severity: ticket
+          slo: latency
+        annotations:
+          summary: Under 99% of requests completing within 1s
+          description: "{{ $value | humanizePercentage }} inside objective over the last hour."
+
+      - alert: ApiDown
+        expr: up{job="surveyhub-api"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: API is not being scraped — process down or unreachable
+
+      - alert: DatabaseUnreachable
+        # /readyz turns 503 when the database check fails, so this fires before users
+        # notice rather than after the error rate has already climbed.
+        expr: |
+          sum(rate(surveyhub_http_requests_total{route="/readyz",status="503"}[5m])) > 0
+        for: 3m
+        labels:
+          severity: page
+        annotations:
+          summary: Readiness probe failing — database unreachable
+
+      # ------------------------------------------------------------- AI spend
+      - alert: GeminiSpendSpike
+        expr: job:gemini_cost:rate1h_usd > 1.0
+        for: 15m
+        labels:
+          severity: ticket
+          cost: gemini
+        annotations:
+          summary: Gemini spend above $1/hour
+          description: >-
+            Currently ${{ $value | printf "%.2f" }}/hour. LLM cost is the operating
+            expense that scales with traffic here; a runaway retry loop is the usual cause.
+
+      - alert: GeminiErrorRateHigh
+        expr: |
+          sum(rate(surveyhub_gemini_calls_total{outcome!="success"}[15m]))
+            /
+          clamp_min(sum(rate(surveyhub_gemini_calls_total[15m])), 1e-9) > 0.10
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Over 10% of Gemini calls failing
+
+      - alert: WebhookDeliveryFailing
+        expr: |
+          sum(rate(surveyhub_webhook_deliveries_total{outcome="failure"}[15m]))
+            /
+          clamp_min(sum(rate(surveyhub_webhook_deliveries_total[15m])), 1e-9) > 0.25
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Over 25% of outbound webhooks failing

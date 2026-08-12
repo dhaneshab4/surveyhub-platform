@@ -18,9 +18,18 @@ from django.contrib import admin
 from django.urls import path, include
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
+from surveys.observability import healthz, metrics_view, readyz
+
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/', include('surveys.urls')),
     path('api/token/', TokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('api/token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
+
+    # Operational endpoints. Deliberately unauthenticated and outside /api/ so that
+    # probes and the Prometheus scraper never need a credential. /metrics must not be
+    # publicly routable in production — see PLATFORM.md.
+    path('healthz', healthz, name='healthz'),
+    path('readyz', readyz, name='readyz'),
+    path('metrics', metrics_view, name='metrics'),
 ]
