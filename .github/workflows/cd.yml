@@ -1,10 +1,14 @@
 name: CD
 
+# Manual until the deployment secrets exist. Re-enable the workflow_run trigger once
+# FLY_API_TOKEN, CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID are set and the
+# `production` environment has a required reviewer — otherwise every push to main
+# fails at the deploy step for want of a credential.
 on:
-  workflow_run:
-    workflows: [CI]
-    types: [completed]
-    branches: [main]
+  # workflow_run:
+  #   workflows: [CI]
+  #   types: [completed]
+  #   branches: [main]
   workflow_dispatch:
     inputs:
       environment:

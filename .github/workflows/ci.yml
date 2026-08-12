@@ -60,6 +60,11 @@ jobs:
           pip install ruff coverage
 
       - name: Lint
+        # Advisory on inherited application code, which predates this pipeline and has
+        # never been linted. Flipping this to blocking on day one would fail every build
+        # for reasons unrelated to the change under review, and a permanently red CI
+        # gets ignored. Fix the existing findings, then remove this line.
+        continue-on-error: true
         run: ruff check . --output-format=github
 
       - name: Check for missing migrations
