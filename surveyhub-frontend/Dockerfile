@@ -9,7 +9,7 @@
 # actually deployed (Cloudflare Pages), so local and production now behave the same.
 
 # ---------------------------------------------------------------------------- builder
-FROM node:20-alpine AS builder
+FROM node:26-alpine AS builder
 WORKDIR /app
 
 COPY package.json package-lock.json ./
