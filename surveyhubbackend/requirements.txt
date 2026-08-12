@@ -34,3 +34,8 @@ websockets==15.0.1
 gunicorn==21.2.0
 whitenoise==6.7.0
 dj-database-url==2.3.0
+
+# --- platform / observability ---
+prometheus-client==0.21.1
+django-structlog==8.1.0
+structlog==24.4.0

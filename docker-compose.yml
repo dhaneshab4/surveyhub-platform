@@ -1,3 +1,9 @@
+# Application stack. For metrics and dashboards add the observability overlay:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d
+#
+# or just `make up`.
+
 services:
   db:
     image: postgres:16-alpine
@@ -13,6 +19,10 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 512M
 
   backend:
     build:
@@ -21,26 +31,60 @@ services:
     env_file: ./surveyhubbackend/.env
     environment:
       DB_HOST: db
+      ENVIRONMENT: local
+      APP_VERSION: ${APP_VERSION:-dev}
+      # Each gunicorn worker keeps its own counters; without a shared directory the
+      # scrape returns whichever worker answered and undercounts by ~3x.
+      PROMETHEUS_MULTIPROC_DIR: /tmp/prometheus
     depends_on:
       db:
         condition: service_healthy
     ports:
-      - "8000:8000"
-    command: >
-      sh -c "python manage.py migrate --noinput &&
-             python -m gunicorn surveyhubbackend.wsgi:application
-               --bind 0.0.0.0:8000 --workers 3"
+      # Configurable so the stack can coexist with whatever else is on the machine.
+      - "${API_PORT:-8000}:8000"
+    tmpfs:
+      # A bare tmpfs mount is created root-owned and masks the directory the image
+      # created for the app user, so the metrics writes fail with EACCES. 1777 gives it
+      # /tmp semantics: anyone may write, only the owner may delete.
+      - /tmp/prometheus:mode=1777
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 25s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    # Single line on purpose. In a YAML folded scalar (`>`), lines indented deeper than
+    # the first are kept literal, so a "nicely" wrapped gunicorn invocation ends up with
+    # real newlines and sh runs `--bind` as its own command.
+    # Flags live in gunicorn.conf.py, which also carries the child_exit metrics hook.
+    command: sh -c "python manage.py migrate --noinput && exec gunicorn -c gunicorn.conf.py surveyhubbackend.wsgi:application"
 
   frontend:
     build:
       context: ./surveyhub-frontend
+      args:
+        # Must be a build arg, not an environment variable: next.config.ts uses
+        # `output: "export"`, so the API URL is compiled into the bundle and a runtime
+        # env var would be silently ignored.
+        #
+        # It is the browser that calls the API, not the container, so this has to be a
+        # host-reachable address — http://backend:8000 only resolves inside the compose
+        # network and would fail in the browser.
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
     restart: unless-stopped
-    environment:
-      NEXT_PUBLIC_API_URL: http://backend:8000
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     ports:
-      - "3000:3000"
+      - "${FRONTEND_PORT:-3000}:8080"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
 
 volumes:
   postgres_data:

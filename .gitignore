@@ -110,3 +110,31 @@ out/
 *.key
 *.p12
 *.pfx
+
+# Terraform — state contains the database connection string and the generated
+# SECRET_KEY in plaintext. It must never reach the repository.
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+terraform/backend.hcl
+!terraform/backend.hcl.example
+# .tfvars files here hold sizing only, but the pattern is a common place for secrets,
+# so anything not explicitly whitelisted stays out.
+*.auto.tfvars
+override.tf
+override.tf.json
+
+# Observability
+prometheus_data/
+grafana_data/
+
+# Local metrics scratch
+/tmp/prometheus/
+
+# Trivy / scanning artefacts
+*.sarif
+.trivycache/
